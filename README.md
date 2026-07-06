@@ -1,7 +1,7 @@
 
-  # Island Hopping Visuals
+  # Island Hopping Reflection Exercise
 
-  This is a code bundle for Island Hopping Visuals. The original project is available at https://www.figma.com/design/M9fuyM1gWWImgdjQDGmIGb/Island-Hopping-Visuals.
+  This is a code bundle for Island Hopping Reflection Exercise. The original project is available at https://www.figma.com/design/M9fuyM1gWWImgdjQDGmIGb/Island-Hopping-Reflection-Exercise.
 
   ## Running the code
 
