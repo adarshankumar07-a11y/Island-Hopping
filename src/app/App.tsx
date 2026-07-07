@@ -270,6 +270,7 @@ export default function App() {
   const [remoteAuditLogs, setRemoteAuditLogs] = useState<AuditEntry[]>([]);
   const [remoteActivityFeed, setRemoteActivityFeed] = useState<ActivityEntry[]>([]);
   const [versionHistory, setVersionHistory] = useState<AuditEntry[]>([]);
+  const [fieldSaveState, setFieldSaveState] = useState<Record<string, "idle" | "saving" | "saved" | "error">>({});
   const hydratedRef = useRef(false);
   const saveTimerRef = useRef<number | null>(null);
   const remoteApplyingRef = useRef(false);
@@ -328,7 +329,7 @@ export default function App() {
     }
 
     hydrateOnce();
-    const interval = window.setInterval(pollMetaOnly, 8000);
+    const interval = window.setInterval(pollMetaOnly, 5000);
     return () => { cancelled = true; window.clearInterval(interval); };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -363,6 +364,27 @@ export default function App() {
       ...cur,
       [island.id]: { ...cur[island.id], [activeTeam.id]: { ...cur[island.id]?.[activeTeam.id], [lane]: value } },
     }));
+  }
+
+  async function saveField(islandId: IslandId, teamId: string, lane: Lane, value: string) {
+    if (countWords(value) > WORD_LIMIT) return;
+    const key = `${islandId}-${teamId}-${lane}`;
+    setFieldSaveState((s) => ({ ...s, [key]: "saving" }));
+    try {
+      const snapshot = { ...answers, [islandId]: { ...answers[islandId], [teamId]: { ...answers[islandId]?.[teamId], [lane]: value } } };
+      const payload = { sessionId: "jul-2026", sessionName: "July Reflection 2026", answers: snapshot, actionPlan, matrix };
+      await apiFetch("/state", {
+        method: "POST",
+        body: JSON.stringify({ state: payload, auth, activeTeamId: teamId, change: { tableName: "reflections", action: "UPSERT", recordId: `${islandId}-${teamId}-${lane}` } }),
+      });
+      setFieldSaveState((s) => ({ ...s, [key]: "saved" }));
+      setSyncState("synced");
+      window.setTimeout(() => setFieldSaveState((s) => ({ ...s, [key]: "idle" })), 2500);
+    } catch {
+      setFieldSaveState((s) => ({ ...s, [key]: "error" }));
+      setSyncState("offline");
+      window.setTimeout(() => setFieldSaveState((s) => ({ ...s, [key]: "idle" })), 3000);
+    }
   }
 
   function updateActionRow(teamId: string, lane: Lane, field: keyof ActionRow, value: string) {
@@ -592,16 +614,33 @@ export default function App() {
                     const overLimit = words > WORD_LIMIT;
                     const nearLimit = pct >= 0.85;
                     const counterColor = overLimit ? "#fb7185" : nearLimit ? "#fbbf24" : "#7fb5a8";
+                    const fieldKey = `${island.id}-${activeTeam.id}-${lane}`;
+                    const fState = fieldSaveState[fieldKey] ?? "idle";
                     return (
-                      <article key={lane} className="rounded-[1.5rem] border bg-card/70 p-5 transition-colors"
-                        style={{ borderColor: overLimit ? "#fb718555" : "var(--border)" }}>
+                      <article key={lane} className="rounded-[1.5rem] border bg-card/70 p-5 transition-colors flex flex-col"
+                        style={{ borderColor: overLimit ? "#fb718555" : fState === "saved" ? "#34d39955" : "var(--border)" }}>
+                        {/* Lane header */}
                         <div className="mb-4 flex items-center gap-3">
                           <div className="rounded-lg px-2.5 py-1 font-mono text-xs font-bold tracking-[.1em]"
                             style={{ background: laneMeta[lane].bg, color: laneMeta[lane].color }}>
                             {laneMeta[lane].label}
                           </div>
                           <span className="text-xs text-muted-foreground">{laneMeta[lane].hint}</span>
+                          {/* Per-field sync badge */}
+                          {fState !== "idle" && (
+                            <span className="ml-auto flex items-center gap-1 rounded-full px-2 py-0.5 font-mono text-[9px] uppercase tracking-[.1em]"
+                              style={{
+                                background: fState === "saved" ? "rgba(52,211,153,.12)" : fState === "error" ? "rgba(251,113,133,.12)" : "rgba(251,191,36,.12)",
+                                color: fState === "saved" ? "#34d399" : fState === "error" ? "#fb7185" : "#fbbf24",
+                              }}>
+                              {fState === "saving" && <span className="mr-0.5 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-current" />}
+                              {fState === "saved" && <Check size={9} />}
+                              {fState === "saving" ? "Saving…" : fState === "saved" ? "Saved" : "Error"}
+                            </span>
+                          )}
                         </div>
+
+                        {/* Prompts */}
                         <ul className="mb-4 space-y-2">
                           {island.lanePrompts[lane].map((p) => (
                             <li key={p} className="flex gap-2 text-xs leading-5 text-muted-foreground">
@@ -609,17 +648,20 @@ export default function App() {
                             </li>
                           ))}
                         </ul>
+
+                        {/* Textarea */}
                         <textarea rows={7}
                           value={text}
                           onChange={(e) => updateAnswer(lane, e.target.value)}
                           placeholder={`${activeTeam.short}: ${laneMeta[lane].label.toLowerCase()} notes…`}
-                          className="w-full resize-none rounded-xl border bg-background/60 p-3.5 text-sm leading-6 outline-none transition-colors focus:border-primary"
+                          className="w-full flex-1 resize-none rounded-xl border bg-background/60 p-3.5 text-sm leading-6 outline-none transition-colors focus:border-primary"
                           style={{
                             fontFamily: "'Plus Jakarta Sans', sans-serif",
                             borderColor: overLimit ? "#fb718577" : "var(--border)",
                           }} />
-                        {/* Word counter */}
-                        <div className="mt-2 flex items-center justify-between gap-2">
+
+                        {/* Word counter bar */}
+                        <div className="mt-2 flex items-center gap-2">
                           <div className="h-1 flex-1 overflow-hidden rounded-full bg-background/60">
                             <div className="h-full rounded-full transition-all duration-300"
                               style={{ width: `${Math.min(pct * 100, 100)}%`, background: counterColor }} />
@@ -628,11 +670,33 @@ export default function App() {
                             {words.toLocaleString()} / {WORD_LIMIT.toLocaleString()}
                           </span>
                         </div>
+
                         {overLimit && (
                           <p className="mt-1.5 text-[11px] font-semibold" style={{ color: "#fb7185" }}>
-                            Word limit exceeded — please shorten your response before saving.
+                            Word limit exceeded — shorten before saving.
                           </p>
                         )}
+
+                        {/* Save button */}
+                        <button
+                          disabled={overLimit || fState === "saving" || !text.trim()}
+                          onClick={() => saveField(island.id, activeTeam.id, lane, text)}
+                          className="mt-3 flex items-center justify-center gap-2 rounded-xl border px-4 py-2.5 text-xs font-semibold transition-all disabled:cursor-not-allowed disabled:opacity-40"
+                          style={{
+                            borderColor: fState === "saved" ? "#34d39966" : fState === "error" ? "#fb718566" : laneMeta[lane].color + "55",
+                            background: fState === "saved" ? "rgba(52,211,153,.12)" : fState === "error" ? "rgba(251,113,133,.10)" : laneMeta[lane].bg,
+                            color: fState === "saved" ? "#34d399" : fState === "error" ? "#fb7185" : laneMeta[lane].color,
+                          }}>
+                          {fState === "saving" ? (
+                            <><span className="h-2.5 w-2.5 animate-spin rounded-full border-2 border-current border-t-transparent" />Saving to Supabase…</>
+                          ) : fState === "saved" ? (
+                            <><Check size={12} />Saved to Supabase</>
+                          ) : fState === "error" ? (
+                            <>⚠ Save failed — retry</>
+                          ) : (
+                            <><UploadCloud size={12} />Save {laneMeta[lane].label}</>
+                          )}
+                        </button>
                       </article>
                     );
                   })}
