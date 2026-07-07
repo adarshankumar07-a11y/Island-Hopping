@@ -230,6 +230,12 @@ const laneMeta: Record<Lane, { label: string; color: string; bg: string; hint: s
   continue: { label: "CONTINUE", color: "#34d399", bg: "rgba(52,211,153,.12)", hint: "Scale strengths" },
 };
 
+const WORD_LIMIT = 5000;
+
+function countWords(text: string): number {
+  return text.trim() === "" ? 0 : text.trim().split(/\s+/).length;
+}
+
 function emptyAnswers(): Answers { return { what: {}, how: {}, sowhat: {}, nowwhat: {} }; }
 function emptyRow(): ActionRow {
   return { action: "", outcomeStatement: "", progressImpact: "", owner: "", dueDate: "", successIndicator: "", status: "not-started" };
@@ -283,33 +289,58 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    async function loadRemoteState() {
+
+    async function hydrateOnce() {
+      // Initial load: pull persisted state from remote and seed local state
       try {
         const data = await apiFetch("/state");
         if (cancelled) return;
         remoteApplyingRef.current = true;
         if (data.state?.answers) setAnswers(data.state.answers);
         if (data.state?.actionPlan) setActionPlan(data.state.actionPlan);
-        if (data.state?.matrix && Object.keys(data.state.matrix).length) setMatrix((current) => ({ ...current, ...data.state.matrix }));
+        if (data.state?.matrix && Object.keys(data.state.matrix).length)
+          setMatrix((cur) => ({ ...cur, ...data.state.matrix }));
         window.setTimeout(() => { remoteApplyingRef.current = false; }, 0);
         setRemoteAuditLogs(data.auditLogs ?? []);
         setRemoteActivityFeed(data.activityFeed ?? []);
         setVersionHistory(data.versionHistory ?? []);
         setSyncState("synced");
       } catch (error) {
-        console.warn("Supabase sync unavailable", error);
+        console.warn("Supabase initial hydration unavailable", error);
         setSyncState("offline");
       } finally {
         hydratedRef.current = true;
       }
     }
-    loadRemoteState();
-    const interval = window.setInterval(loadRemoteState, 8000);
+
+    async function pollMetaOnly() {
+      // Subsequent polls: only refresh admin metadata — never touch editable state
+      try {
+        const data = await apiFetch("/state");
+        if (cancelled) return;
+        setRemoteAuditLogs(data.auditLogs ?? []);
+        setRemoteActivityFeed(data.activityFeed ?? []);
+        setVersionHistory(data.versionHistory ?? []);
+        if (syncState !== "saving") setSyncState("synced");
+      } catch {
+        // silently ignore poll failures — don't overwrite sync badge if mid-save
+      }
+    }
+
+    hydrateOnce();
+    const interval = window.setInterval(pollMetaOnly, 8000);
     return () => { cancelled = true; window.clearInterval(interval); };
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!auth || !hydratedRef.current || remoteApplyingRef.current) return;
+    // Block save if any reflection exceeds the word limit
+    const anyOverLimit = islands.some((isl) =>
+      teams.some((t) =>
+        lanes.some((lane) => countWords(answers[isl.id]?.[t.id]?.[lane] ?? "") > WORD_LIMIT)
+      )
+    );
+    if (anyOverLimit) { setSyncState("offline"); return; }
     if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
     setSyncState("saving");
     saveTimerRef.current = window.setTimeout(async () => {
@@ -554,30 +585,57 @@ export default function App() {
                   )}
                 </div>
                 <div className="grid gap-4 xl:grid-cols-3">
-                  {lanes.map((lane) => (
-                    <article key={lane} className="rounded-[1.5rem] border border-border bg-card/70 p-5">
-                      <div className="mb-4 flex items-center gap-3">
-                        <div className="rounded-lg px-2.5 py-1 font-mono text-xs font-bold tracking-[.1em]"
-                          style={{ background: laneMeta[lane].bg, color: laneMeta[lane].color }}>
-                          {laneMeta[lane].label}
+                  {lanes.map((lane) => {
+                    const text = answers[island.id]?.[activeTeam.id]?.[lane] ?? "";
+                    const words = countWords(text);
+                    const pct = words / WORD_LIMIT;
+                    const overLimit = words > WORD_LIMIT;
+                    const nearLimit = pct >= 0.85;
+                    const counterColor = overLimit ? "#fb7185" : nearLimit ? "#fbbf24" : "#7fb5a8";
+                    return (
+                      <article key={lane} className="rounded-[1.5rem] border bg-card/70 p-5 transition-colors"
+                        style={{ borderColor: overLimit ? "#fb718555" : "var(--border)" }}>
+                        <div className="mb-4 flex items-center gap-3">
+                          <div className="rounded-lg px-2.5 py-1 font-mono text-xs font-bold tracking-[.1em]"
+                            style={{ background: laneMeta[lane].bg, color: laneMeta[lane].color }}>
+                            {laneMeta[lane].label}
+                          </div>
+                          <span className="text-xs text-muted-foreground">{laneMeta[lane].hint}</span>
                         </div>
-                        <span className="text-xs text-muted-foreground">{laneMeta[lane].hint}</span>
-                      </div>
-                      <ul className="mb-4 space-y-2">
-                        {island.lanePrompts[lane].map((p) => (
-                          <li key={p} className="flex gap-2 text-xs leading-5 text-muted-foreground">
-                            <Anchor size={12} className="mt-0.5 shrink-0" style={{ color: laneMeta[lane].color }} />{p}
-                          </li>
-                        ))}
-                      </ul>
-                      <textarea rows={7}
-                        value={answers[island.id]?.[activeTeam.id]?.[lane] ?? ""}
-                        onChange={(e) => updateAnswer(lane, e.target.value)}
-                        placeholder={`${activeTeam.short}: ${laneMeta[lane].label.toLowerCase()} notes…`}
-                        className="w-full resize-none rounded-xl border border-border bg-background/60 p-3.5 text-sm leading-6 outline-none transition-colors focus:border-primary"
-                        style={{ fontFamily: "'Plus Jakarta Sans', sans-serif" }} />
-                    </article>
-                  ))}
+                        <ul className="mb-4 space-y-2">
+                          {island.lanePrompts[lane].map((p) => (
+                            <li key={p} className="flex gap-2 text-xs leading-5 text-muted-foreground">
+                              <Anchor size={12} className="mt-0.5 shrink-0" style={{ color: laneMeta[lane].color }} />{p}
+                            </li>
+                          ))}
+                        </ul>
+                        <textarea rows={7}
+                          value={text}
+                          onChange={(e) => updateAnswer(lane, e.target.value)}
+                          placeholder={`${activeTeam.short}: ${laneMeta[lane].label.toLowerCase()} notes…`}
+                          className="w-full resize-none rounded-xl border bg-background/60 p-3.5 text-sm leading-6 outline-none transition-colors focus:border-primary"
+                          style={{
+                            fontFamily: "'Plus Jakarta Sans', sans-serif",
+                            borderColor: overLimit ? "#fb718577" : "var(--border)",
+                          }} />
+                        {/* Word counter */}
+                        <div className="mt-2 flex items-center justify-between gap-2">
+                          <div className="h-1 flex-1 overflow-hidden rounded-full bg-background/60">
+                            <div className="h-full rounded-full transition-all duration-300"
+                              style={{ width: `${Math.min(pct * 100, 100)}%`, background: counterColor }} />
+                          </div>
+                          <span className="font-mono text-[10px] tabular-nums" style={{ color: counterColor }}>
+                            {words.toLocaleString()} / {WORD_LIMIT.toLocaleString()}
+                          </span>
+                        </div>
+                        {overLimit && (
+                          <p className="mt-1.5 text-[11px] font-semibold" style={{ color: "#fb7185" }}>
+                            Word limit exceeded — please shorten your response before saving.
+                          </p>
+                        )}
+                      </article>
+                    );
+                  })}
                 </div>
               </div>
             </div>
