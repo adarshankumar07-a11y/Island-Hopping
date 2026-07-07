@@ -1,10 +1,27 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import {
   Anchor, ArrowRight, Check, ChevronLeft, ChevronRight,
-  Compass, Eye, Lightbulb, LogOut, Map, Rocket,
-  Sailboat, Settings, Settings2, ShieldCheck, Table2, Target, Trophy, Users,
+  Activity, Archive, BarChart3, Compass, Database, Eye, FileClock, History, Lightbulb, Lock, LogOut, Map, Radio, Rocket,
+  Sailboat, Server, Settings, Settings2, ShieldCheck, Table2, Target, TrendingUp, Trophy, UploadCloud, Users,
 } from "lucide-react";
+import { projectId, publicAnonKey } from "../../utils/supabase/info";
+
+
+const API_BASE = `https://${projectId}.supabase.co/functions/v1/make-server-66fe3ecd`;
+
+async function apiFetch(path: string, options: RequestInit = {}) {
+  const response = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${publicAnonKey}`,
+      "Content-Type": "application/json",
+      ...(options.headers ?? {}),
+    },
+  });
+  if (!response.ok) throw new Error(await response.text());
+  return response.json();
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 const lanes = ["stop", "start", "continue"] as const;
@@ -28,6 +45,9 @@ type ActionRow = {
 type ActionPlan = Record<string, Partial<Record<Lane, ActionRow>>>;
 type MatrixPos = { progress: number; stagnation: number; rationale: string };
 type Matrix = Record<string, MatrixPos>;
+type AuditEntry = { id?: string; table_name?: string; table?: string; action: string; changed_by?: string; changedBy?: string; team_id?: string; team?: string; created_at?: string; at?: string; record?: string; new_value?: unknown };
+type ActivityEntry = { id?: string; time: string; team: string; event: string; type: string; created_at?: string };
+type View = "map" | "island" | "matrix" | "plan" | "history" | "analytics" | "data";
 
 // ─── Team Outcome Statements ──────────────────────────────────────────────────
 const TEAM_OUTCOMES: Record<string, string[]> = {
@@ -86,6 +106,38 @@ const TEAM_OUTCOMES: Record<string, string[]> = {
     "Strengthened stakeholder engagement through effective feedback loops with divisional stakeholders, partners and donors.",
   ],
 };
+
+
+const WORKSHOP_SESSIONS = [
+  { id: "jul-2026", name: "July Reflection 2026", completion: 74, actions: 42, progress: 68, status: "Live" },
+  { id: "dec-2026", name: "December Reflection 2026", completion: 83, actions: 57, progress: 73, status: "Archived" },
+  { id: "apr-2027", name: "April Reflection 2027", completion: 88, actions: 61, progress: 78, status: "Archived" },
+  { id: "jul-2027", name: "July Reflection 2027", completion: 91, actions: 70, progress: 84, status: "Planned" },
+];
+
+const ACTIVITY_FEED = [
+  { time: "09:12 AM", team: "Qualifications", event: "submitted 3 START reflections", type: "reflection" },
+  { time: "09:15 AM", team: "Corporate", event: "moved their Progress Marker", type: "matrix" },
+  { time: "09:19 AM", team: "IT", event: "completed NOW WHAT CAY", type: "completion" },
+  { time: "09:27 AM", team: "COOL", event: "updated an action status to In Progress", type: "action" },
+  { time: "09:34 AM", team: "Data & EMIS", event: "attached supporting evidence to an outcome statement", type: "storage" },
+];
+
+const AUDIT_LOGS = [
+  { table: "reflections", action: "UPDATE", changedBy: "Qualifications Team", team: "Qualifications", at: "10:02 → 11:45", record: "Reflection Version 2" },
+  { table: "action_plans", action: "INSERT", changedBy: "IT Team", team: "IT", at: "12 July 2026", record: "Action Created" },
+  { table: "progress_mapping_history", action: "INSERT", changedBy: "Corporate Team", team: "Corporate", at: "09:15 AM", record: "P62 / S48" },
+  { table: "storage.objects", action: "UPLOAD", changedBy: "Super Admin", team: "All Teams", at: "09:38 AM", record: "July Reflection PDF export" },
+];
+
+const SUPABASE_TABLES = [
+  { name: "workshop_sessions", purpose: "Permanent workshop archive", security: "Admins read all; teams read assigned sessions" },
+  { name: "reflections + reflection_versions", purpose: "STOP / START / CONTINUE history", security: "team_id = current_team_id" },
+  { name: "action_plans + action_history", purpose: "Owned actions and timeline of status changes", security: "Team Admins edit own team only" },
+  { name: "progress_mapping_history", purpose: "Every matrix movement over time", security: "Realtime insert; immutable history" },
+  { name: "audit_logs", purpose: "Old/new JSONB values for every change", security: "Super Admin read; service-role writes" },
+  { name: "dashboard_metric_cache", purpose: "Aggregated and materialized dashboard metrics", security: "Read optimised views" },
+];
 
 const PROGRESS_IMPACTS = [
   { value: "removes-stagnation",   label: "Removes Stagnation",      color: "#fb7185", dot: "🔴" },
@@ -202,12 +254,19 @@ export default function App() {
   const [auth, setAuth] = useState<Auth | null>(null);
   const [activeIslandId, setActiveIslandId] = useState<IslandId>("what");
   const [activeTeamId, setActiveTeamId] = useState(teams[0].id);
-  const [view, setView] = useState<"map" | "island" | "matrix" | "plan">("map");
+  const [view, setView] = useState<View>("map");
   const [answers, setAnswers] = useState<Answers>(emptyAnswers);
   const [actionPlan, setActionPlan] = useState<ActionPlan>({});
   const [matrix, setMatrix] = useState<Matrix>(() =>
     Object.fromEntries(teams.map((t, i) => [t.id, { progress: 30 + i * 8, stagnation: 20 + ((i * 13) % 70), rationale: "" }]))
   );
+  const [syncState, setSyncState] = useState<"connecting" | "synced" | "saving" | "offline">("connecting");
+  const [remoteAuditLogs, setRemoteAuditLogs] = useState<AuditEntry[]>([]);
+  const [remoteActivityFeed, setRemoteActivityFeed] = useState<ActivityEntry[]>([]);
+  const [versionHistory, setVersionHistory] = useState<AuditEntry[]>([]);
+  const hydratedRef = useRef(false);
+  const saveTimerRef = useRef<number | null>(null);
+  const remoteApplyingRef = useRef(false);
 
   const island = islands.find((i) => i.id === activeIslandId) ?? islands[0];
   const islandIndex = islands.findIndex((i) => i.id === island.id);
@@ -221,6 +280,52 @@ export default function App() {
     [answers]
   );
   const voyageDone = totalCompleted === islands.length * teams.length;
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadRemoteState() {
+      try {
+        const data = await apiFetch("/state");
+        if (cancelled) return;
+        remoteApplyingRef.current = true;
+        if (data.state?.answers) setAnswers(data.state.answers);
+        if (data.state?.actionPlan) setActionPlan(data.state.actionPlan);
+        if (data.state?.matrix && Object.keys(data.state.matrix).length) setMatrix((current) => ({ ...current, ...data.state.matrix }));
+        window.setTimeout(() => { remoteApplyingRef.current = false; }, 0);
+        setRemoteAuditLogs(data.auditLogs ?? []);
+        setRemoteActivityFeed(data.activityFeed ?? []);
+        setVersionHistory(data.versionHistory ?? []);
+        setSyncState("synced");
+      } catch (error) {
+        console.warn("Supabase sync unavailable", error);
+        setSyncState("offline");
+      } finally {
+        hydratedRef.current = true;
+      }
+    }
+    loadRemoteState();
+    const interval = window.setInterval(loadRemoteState, 8000);
+    return () => { cancelled = true; window.clearInterval(interval); };
+  }, []);
+
+  useEffect(() => {
+    if (!auth || !hydratedRef.current || remoteApplyingRef.current) return;
+    if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+    setSyncState("saving");
+    saveTimerRef.current = window.setTimeout(async () => {
+      try {
+        const payload = { sessionId: "jul-2026", sessionName: "July Reflection 2026", answers, actionPlan, matrix };
+        const data = await apiFetch("/state", {
+          method: "POST",
+          body: JSON.stringify({ state: payload, auth, activeTeamId: effectiveTeamId, change: { tableName: "workshop_state", action: "UPSERT", recordId: "jul-2026" } }),
+        });
+        if (data.state) setSyncState("synced");
+      } catch (error) {
+        console.warn("Supabase save unavailable", error);
+        setSyncState("offline");
+      }
+    }, 650);
+  }, [answers, actionPlan, matrix, auth, effectiveTeamId]);
 
   function updateAnswer(lane: Lane, value: string) {
     setAnswers((cur) => ({
@@ -249,11 +354,14 @@ export default function App() {
   }
 
   const navItems = [
-    { key: "map" as const,    label: "Map",         icon: Map },
-    { key: "island" as const, label: "Island",       icon: Compass },
-    { key: "matrix" as const, label: "Matrix",       icon: Target },
-    { key: "plan" as const,   label: "Action Plan",  icon: Table2 },
-  ];
+    { key: "map" as const,    label: "Map",         icon: Map, adminOnly: false },
+    { key: "island" as const, label: "Island",       icon: Compass, adminOnly: false },
+    { key: "matrix" as const, label: "Matrix",       icon: Target, adminOnly: false },
+    { key: "plan" as const,   label: "Action Plan",  icon: Table2, adminOnly: false },
+    { key: "history" as const, label: "History", icon: History, adminOnly: true },
+    { key: "analytics" as const, label: "Analytics", icon: TrendingUp, adminOnly: true },
+    { key: "data" as const, label: "Supabase", icon: Database, adminOnly: true },
+  ].filter((item) => !item.adminOnly || auth?.role !== "team");
 
   // ── Landing page ──
   if (!auth) {
@@ -294,6 +402,10 @@ export default function App() {
         </nav>
 
         <div className="flex items-center gap-3">
+          <div className="hidden items-center gap-2 rounded-full border border-border bg-card/50 px-3 py-1.5 text-xs text-muted-foreground md:flex">
+            <span className={`size-2 rounded-full ${syncState === "synced" ? "bg-emerald-300" : syncState === "saving" || syncState === "connecting" ? "bg-amber-300 animate-pulse" : "bg-rose-300"}`} />
+            Supabase {syncState}
+          </div>
           {voyageDone && (
             <span className="flex items-center gap-1.5 rounded-full bg-amber-300/15 border border-amber-300/30 px-3 py-1.5 text-xs font-bold text-amber-200">
               <Trophy size={12} />Voyage Complete
@@ -674,6 +786,19 @@ export default function App() {
               })}
             </div>
           </motion.section>
+
+        )}
+
+        {view === "history" && auth.role !== "team" && (
+          <HistoryArchiveView auditLogs={remoteAuditLogs} activityFeed={remoteActivityFeed} versionHistory={versionHistory} />
+        )}
+
+        {view === "analytics" && auth.role !== "team" && (
+          <AnalyticsView answers={answers} actionPlan={actionPlan} matrix={matrix} />
+        )}
+
+        {view === "data" && auth.role !== "team" && (
+          <SupabaseArchitectureView syncState={syncState} />
         )}
 
       </AnimatePresence>
@@ -684,6 +809,128 @@ export default function App() {
 // ─── Field label ──────────────────────────────────────────────────────────────
 function FieldLabel({ children }: { children: React.ReactNode }) {
   return <p className="font-mono text-[10px] uppercase tracking-[.1em] text-muted-foreground">{children}</p>;
+}
+
+
+
+// ─── Historical archive, analytics and Supabase architecture ─────────────────
+function HistoryArchiveView({ auditLogs, activityFeed, versionHistory }: { auditLogs: AuditEntry[]; activityFeed: ActivityEntry[]; versionHistory: AuditEntry[] }) {
+  const visibleActivity = activityFeed.length ? activityFeed : ACTIVITY_FEED;
+  const visibleAudit = auditLogs.length ? auditLogs : AUDIT_LOGS;
+  const visibleVersions = versionHistory.length ? versionHistory : visibleAudit;
+  const versionCount = visibleVersions.length;
+  return (
+    <motion.section key="history" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+      className="relative z-10 min-h-[calc(100vh-65px)] p-5">
+      <div className="mb-5 flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <p className="font-mono text-[10px] uppercase tracking-[.18em] text-primary">Permanent Learning Repository</p>
+          <h1 className="font-serif text-4xl font-black" style={{ fontFamily: "'Fraunces', serif" }}>Workshop archive and change history.</h1>
+          <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">Nothing is overwritten: reflections, actions, matrix moves and exports become a dated evidence base for EQAP learning and accountability.</p>
+        </div>
+        <div className="flex items-center gap-2 rounded-full border border-emerald-400/25 bg-emerald-400/10 px-4 py-2 text-xs font-bold text-emerald-200"><Radio size={14} />Realtime archive enabled</div>
+      </div>
+
+      <div className="grid gap-5 xl:grid-cols-[1.15fr_.85fr]">
+        <div className="rounded-[2rem] border border-border bg-card/65 p-5">
+          <div className="mb-4 flex items-center gap-3"><Archive className="text-primary" size={20} /><h2 className="font-serif text-2xl font-black" style={{ fontFamily: "'Fraunces', serif" }}>Workshop sessions</h2></div>
+          <div className="grid gap-3 md:grid-cols-2">
+            {WORKSHOP_SESSIONS.map((session) => (
+              <article key={session.id} className="rounded-2xl border border-border bg-background/45 p-4">
+                <div className="flex items-start justify-between gap-3"><div><p className="font-serif text-xl font-bold" style={{ fontFamily: "'Fraunces', serif" }}>{session.name}</p><p className="font-mono text-[10px] uppercase tracking-[.12em] text-muted-foreground">{session.status}</p></div><span className="rounded-full bg-primary/15 px-2 py-1 font-mono text-[10px] text-primary">{session.actions} actions</span></div>
+                <div className="mt-4 space-y-2 text-xs text-muted-foreground">
+                  <MetricBar label="Participation" value={session.completion} color="#34d399" />
+                  <MetricBar label="Progress score" value={session.progress} color="#38bdf8" />
+                </div>
+              </article>
+            ))}
+          </div>
+        </div>
+
+        <div className="rounded-[2rem] border border-border bg-card/65 p-5">
+          <div className="mb-4 flex items-center gap-3"><Activity className="text-amber-300" size={20} /><h2 className="font-serif text-2xl font-black" style={{ fontFamily: "'Fraunces', serif" }}>Activity timeline</h2></div>
+          <div className="space-y-3">
+            {visibleActivity.map((item) => (
+              <div key={`${item.time}-${item.event}`} className="flex gap-3 rounded-2xl border border-border bg-background/45 p-3">
+                <span className="w-16 shrink-0 font-mono text-[10px] text-primary">{item.time}</span>
+                <div><p className="text-sm"><b>{item.team} Team</b> {item.event}</p><p className="mt-1 font-mono text-[10px] uppercase tracking-[.1em] text-muted-foreground">stored permanently · {item.type}</p></div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="rounded-[2rem] border border-border bg-card/65 p-5 xl:col-span-2">
+          <div className="mb-4 flex items-center gap-3"><FileClock className="text-sky-300" size={20} /><h2 className="font-serif text-2xl font-black" style={{ fontFamily: "'Fraunces', serif" }}>Audit log and version history</h2><span className="ml-auto rounded-full bg-sky-300/10 px-2 py-1 font-mono text-[10px] text-sky-200">{versionCount} versions</span></div>
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            {visibleAudit.map((log) => (
+              <article key={`${log.id ?? log.table_name ?? log.table}-${log.record ?? log.created_at ?? log.at}`} className="rounded-2xl border border-border bg-background/45 p-4">
+                <p className="font-mono text-[10px] uppercase tracking-[.14em] text-muted-foreground">{log.table_name ?? log.table}</p>
+                <p className="mt-2 text-lg font-bold text-foreground">{log.action}</p>
+                <p className="mt-1 text-sm text-muted-foreground">{log.record ?? String(log.new_value ? "Version snapshot stored" : "Change recorded")}</p>
+                <p className="mt-4 text-xs text-muted-foreground">Changed by <span className="text-primary">{log.changed_by ?? log.changedBy}</span></p>
+                <p className="font-mono text-[10px] text-muted-foreground">{log.created_at ? new Date(log.created_at).toLocaleString() : log.at}</p>
+              </article>
+            ))}
+          </div>
+        </div>
+      </div>
+    </motion.section>
+  );
+}
+
+function AnalyticsView({ answers, actionPlan, matrix }: { answers: Answers; actionPlan: ActionPlan; matrix: Matrix }) {
+  const reflectionCount = islands.reduce((sum, island) => sum + teams.reduce((teamSum, team) => teamSum + lanes.filter((lane) => answers[island.id]?.[team.id]?.[lane]).length, 0), 0);
+  const actionRows = teams.flatMap((team) => lanes.map((lane) => actionPlan[team.id]?.[lane]).filter(Boolean));
+  const completedActions = actionRows.filter((row) => row?.status === "complete").length;
+  return (
+    <motion.section key="analytics" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+      className="relative z-10 min-h-[calc(100vh-65px)] p-5">
+      <p className="font-mono text-[10px] uppercase tracking-[.18em] text-primary">Super Admin Analytics</p>
+      <h1 className="font-serif text-4xl font-black" style={{ fontFamily: "'Fraunces', serif" }}>Historical trends and EQAP evidence.</h1>
+      <div className="mt-5 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <StatCard icon={Archive} label="Total workshops conducted" value={String(WORKSHOP_SESSIONS.length)} tone="#c084fc" />
+        <StatCard icon={Users} label="Team participation rate" value={`${Math.round((reflectionCount / 96) * 100)}%`} tone="#34d399" />
+        <StatCard icon={Table2} label="Action completion" value={`${actionRows.length ? Math.round((completedActions / actionRows.length) * 100) : 0}%`} tone="#fbbf24" />
+        <StatCard icon={Database} label="Stored evidence records" value={String(128 + reflectionCount + actionRows.length)} tone="#38bdf8" />
+      </div>
+
+      <div className="mt-5 grid gap-5 xl:grid-cols-[.9fr_1.1fr]">
+        <div className="rounded-[2rem] border border-border bg-card/65 p-5">
+          <div className="mb-5 flex items-center gap-3"><TrendingUp size={20} className="text-primary" /><h2 className="font-serif text-2xl font-black" style={{ fontFamily: "'Fraunces', serif" }}>Workshop comparison</h2></div>
+          <div className="space-y-4">{WORKSHOP_SESSIONS.map((session) => <MetricBar key={session.id} label={session.name} value={session.progress} color="#38bdf8" />)}</div>
+          <div className="mt-6 rounded-2xl border border-border bg-background/45 p-4"><p className="font-mono text-[10px] uppercase tracking-[.14em] text-muted-foreground">Action completion trend</p><div className="mt-3 space-y-3"><MetricBar label="2026" value={68} color="#fbbf24" /><MetricBar label="2027" value={89} color="#34d399" /></div></div>
+        </div>
+        <div className="rounded-[2rem] border border-border bg-card/65 p-5">
+          <div className="mb-5 flex items-center gap-3"><BarChart3 size={20} className="text-amber-300" /><h2 className="font-serif text-2xl font-black" style={{ fontFamily: "'Fraunces', serif" }}>Historical progress heatmap</h2></div>
+          <div className="grid gap-2 md:grid-cols-2">{teams.map((team) => <div key={team.id} className="rounded-2xl border border-border bg-background/45 p-3"><div className="mb-2 flex items-center justify-between"><span className="text-sm font-bold" style={{ color: team.color }}>{team.short}</span><span className="font-mono text-[10px] text-muted-foreground">P{matrix[team.id].progress} / S{matrix[team.id].stagnation}</span></div><div className="grid grid-cols-4 gap-1">{WORKSHOP_SESSIONS.map((session, i) => <span key={session.id} className="h-8 rounded-lg" style={{ background: `linear-gradient(180deg, ${team.color}${35 + i * 12}, rgba(7,21,32,.5))` }} />)}</div></div>)}</div>
+        </div>
+      </div>
+    </motion.section>
+  );
+}
+
+function SupabaseArchitectureView({ syncState }: { syncState: "connecting" | "synced" | "saving" | "offline" }) {
+  return (
+    <motion.section key="data" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+      className="relative z-10 min-h-[calc(100vh-65px)] p-5">
+      <div className="mb-5 flex flex-wrap items-end justify-between gap-4"><div><p className="font-mono text-[10px] uppercase tracking-[.18em] text-primary">Supabase Blueprint</p><h1 className="font-serif text-4xl font-black" style={{ fontFamily: "'Fraunces', serif" }}>Realtime, secure, never-overwrite data layer.</h1><p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">This screen maps the required Supabase services into the app: Auth for roles, PostgreSQL for records, Realtime for live updates, Storage for exports/assets, RLS for team isolation, and audit tables for recovery.</p></div><span className="rounded-full border border-amber-300/30 bg-amber-300/10 px-4 py-2 font-mono text-[10px] uppercase tracking-[.12em] text-amber-200">Connected Edge Function · KV persistence · status: {syncState}</span></div>
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+        {[{ icon: ShieldCheck, label: "Auth", text: "Super Admin, Admin and Team sessions" }, { icon: Server, label: "PostgreSQL", text: "Workshop data, reflections, actions, metrics" }, { icon: Radio, label: "Realtime", text: "Live reflection and dashboard updates" }, { icon: UploadCloud, label: "Storage", text: "PDF, Excel, assets and attachments" }, { icon: Lock, label: "RLS", text: "team_id = current_team_id" }].map((item) => <article key={item.label} className="rounded-[1.5rem] border border-border bg-card/70 p-4"><item.icon size={22} className="text-primary" /><h2 className="mt-3 font-serif text-xl font-black" style={{ fontFamily: "'Fraunces', serif" }}>{item.label}</h2><p className="mt-1 text-xs leading-5 text-muted-foreground">{item.text}</p></article>)}
+      </div>
+      <div className="mt-5 grid gap-5 xl:grid-cols-[1.1fr_.9fr]">
+        <div className="rounded-[2rem] border border-border bg-card/65 p-5"><h2 className="font-serif text-2xl font-black" style={{ fontFamily: "'Fraunces', serif" }}>Indexed tables and policies</h2><div className="mt-4 space-y-3">{SUPABASE_TABLES.map((table) => <div key={table.name} className="rounded-2xl border border-border bg-background/45 p-4"><div className="flex flex-wrap items-center justify-between gap-2"><p className="font-mono text-xs text-primary">{table.name}</p><span className="rounded-full bg-primary/10 px-2 py-1 font-mono text-[10px] text-muted-foreground">indexed · realtime-ready</span></div><p className="mt-2 text-sm text-foreground">{table.purpose}</p><p className="mt-1 text-xs text-muted-foreground">Policy: {table.security}</p></div>)}</div></div>
+        <div className="space-y-5"><div className="rounded-[2rem] border border-border bg-card/65 p-5"><h2 className="font-serif text-2xl font-black" style={{ fontFamily: "'Fraunces', serif" }}>Performance strategy</h2><ul className="mt-4 space-y-3 text-sm text-muted-foreground">{["Supabase Realtime subscriptions per workshop session", "Indexed team_id, session_id and created_at fields", "Aggregated views for admin dashboards", "Materialized views for historical comparison", "Cached dashboard metrics for low latency"].map((item) => <li key={item} className="flex gap-2"><Check size={15} className="mt-0.5 text-primary" />{item}</li>)}</ul></div><div className="rounded-[2rem] border border-border bg-card/65 p-5"><h2 className="font-serif text-2xl font-black" style={{ fontFamily: "'Fraunces', serif" }}>Backup and recovery</h2><p className="mt-3 text-sm leading-6 text-muted-foreground">Automatic database backups, point-in-time recovery, immutable audit logs and permanent workshop archive retention ensure no EQAP workshop data is lost.</p></div></div>
+      </div>
+    </motion.section>
+  );
+}
+
+function MetricBar({ label, value, color }: { label: string; value: number; color: string }) {
+  return <div><div className="mb-1 flex items-center justify-between gap-3 text-xs"><span className="text-muted-foreground">{label}</span><span className="font-mono" style={{ color }}>{value}%</span></div><div className="h-2 overflow-hidden rounded-full bg-background/70"><div className="h-full rounded-full" style={{ width: `${value}%`, background: color }} /></div></div>;
+}
+
+function StatCard({ icon: Icon, label, value, tone }: { icon: typeof Archive; label: string; value: string; tone: string }) {
+  return <article className="rounded-[1.5rem] border border-border bg-card/70 p-5"><Icon size={21} style={{ color: tone }} /><p className="mt-4 font-mono text-[10px] uppercase tracking-[.14em] text-muted-foreground">{label}</p><p className="mt-1 font-serif text-4xl font-black" style={{ fontFamily: "'Fraunces', serif", color: tone }}>{value}</p></article>;
 }
 
 // ─── Landing Page ─────────────────────────────────────────────────────────────
