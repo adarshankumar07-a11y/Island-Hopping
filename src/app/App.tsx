@@ -272,7 +272,6 @@ export default function App() {
   const [versionHistory, setVersionHistory] = useState<AuditEntry[]>([]);
   const [fieldSaveState, setFieldSaveState] = useState<Record<string, "idle" | "saving" | "saved" | "error">>({});
   const hydratedRef = useRef(false);
-  const saveTimerRef = useRef<number | null>(null);
   const remoteApplyingRef = useRef(false);
 
   const island = islands.find((i) => i.id === activeIslandId) ?? islands[0];
@@ -333,31 +332,9 @@ export default function App() {
     return () => { cancelled = true; window.clearInterval(interval); };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => {
-    if (!auth || !hydratedRef.current || remoteApplyingRef.current) return;
-    // Block save if any reflection exceeds the word limit
-    const anyOverLimit = islands.some((isl) =>
-      teams.some((t) =>
-        lanes.some((lane) => countWords(answers[isl.id]?.[t.id]?.[lane] ?? "") > WORD_LIMIT)
-      )
-    );
-    if (anyOverLimit) { setSyncState("offline"); return; }
-    if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
-    setSyncState("saving");
-    saveTimerRef.current = window.setTimeout(async () => {
-      try {
-        const payload = { sessionId: "jul-2026", sessionName: "July Reflection 2026", answers, actionPlan, matrix };
-        const data = await apiFetch("/state", {
-          method: "POST",
-          body: JSON.stringify({ state: payload, auth, activeTeamId: effectiveTeamId, change: { tableName: "workshop_state", action: "UPSERT", recordId: "jul-2026" } }),
-        });
-        if (data.state) setSyncState("synced");
-      } catch (error) {
-        console.warn("Supabase save unavailable", error);
-        setSyncState("offline");
-      }
-    }, 650);
-  }, [answers, actionPlan, matrix, auth, effectiveTeamId]);
+  // Editable workshop text is saved manually with each field Save button.
+  // Polling only refreshes metadata and never overwrites local typing.
+
 
   function updateAnswer(lane: Lane, value: string) {
     setAnswers((cur) => ({
@@ -373,10 +350,28 @@ export default function App() {
     try {
       const snapshot = { ...answers, [islandId]: { ...answers[islandId], [teamId]: { ...answers[islandId]?.[teamId], [lane]: value } } };
       const payload = { sessionId: "jul-2026", sessionName: "July Reflection 2026", answers: snapshot, actionPlan, matrix };
-      await apiFetch("/state", {
+      const data = await apiFetch("/state", {
         method: "POST",
-        body: JSON.stringify({ state: payload, auth, activeTeamId: teamId, change: { tableName: "reflections", action: "UPSERT", recordId: `${islandId}-${teamId}-${lane}` } }),
+        body: JSON.stringify({
+          state: payload,
+          auth,
+          activeTeamId: teamId,
+          change: {
+            tableName: "reflections",
+            action: "UPSERT",
+            recordId: `${islandId}-${teamId}-${lane}`,
+            islandId,
+            teamId,
+            lane,
+            value,
+          },
+        }),
       });
+      if (data.state?.answers) {
+        remoteApplyingRef.current = true;
+        setAnswers(data.state.answers);
+        window.setTimeout(() => { remoteApplyingRef.current = false; }, 0);
+      }
       setFieldSaveState((s) => ({ ...s, [key]: "saved" }));
       setSyncState("synced");
       window.setTimeout(() => setFieldSaveState((s) => ({ ...s, [key]: "idle" })), 2500);
@@ -384,6 +379,65 @@ export default function App() {
       setFieldSaveState((s) => ({ ...s, [key]: "error" }));
       setSyncState("offline");
       window.setTimeout(() => setFieldSaveState((s) => ({ ...s, [key]: "idle" })), 3000);
+    }
+  }
+
+
+  async function saveActionRow(teamId: string, lane: Lane) {
+    const row = getActionRow(teamId, lane);
+    const key = `action-${teamId}-${lane}`;
+    setFieldSaveState((state) => ({ ...state, [key]: "saving" }));
+    try {
+      const data = await apiFetch("/state", {
+        method: "POST",
+        body: JSON.stringify({
+          state: { sessionId: "jul-2026", sessionName: "July Reflection 2026", answers, actionPlan, matrix },
+          auth,
+          activeTeamId: teamId,
+          change: { tableName: "action_plans", action: "UPSERT", recordId: `${teamId}-${lane}`, teamId, lane, row },
+        }),
+      });
+      if (data.state?.actionPlan) {
+        remoteApplyingRef.current = true;
+        setActionPlan(data.state.actionPlan);
+        window.setTimeout(() => { remoteApplyingRef.current = false; }, 0);
+      }
+      setFieldSaveState((state) => ({ ...state, [key]: "saved" }));
+      setSyncState("synced");
+      window.setTimeout(() => setFieldSaveState((state) => ({ ...state, [key]: "idle" })), 2500);
+    } catch {
+      setFieldSaveState((state) => ({ ...state, [key]: "error" }));
+      setSyncState("offline");
+      window.setTimeout(() => setFieldSaveState((state) => ({ ...state, [key]: "idle" })), 3000);
+    }
+  }
+
+  async function saveMatrixPosition(teamId: string) {
+    const key = `matrix-${teamId}`;
+    const position = matrix[teamId];
+    setFieldSaveState((state) => ({ ...state, [key]: "saving" }));
+    try {
+      const data = await apiFetch("/state", {
+        method: "POST",
+        body: JSON.stringify({
+          state: { sessionId: "jul-2026", sessionName: "July Reflection 2026", answers, actionPlan, matrix },
+          auth,
+          activeTeamId: teamId,
+          change: { tableName: "progress_mapping_history", action: "INSERT", recordId: `jul-2026-${teamId}-${Date.now()}`, teamId, position },
+        }),
+      });
+      if (data.state?.matrix) {
+        remoteApplyingRef.current = true;
+        setMatrix((current) => ({ ...current, ...data.state.matrix }));
+        window.setTimeout(() => { remoteApplyingRef.current = false; }, 0);
+      }
+      setFieldSaveState((state) => ({ ...state, [key]: "saved" }));
+      setSyncState("synced");
+      window.setTimeout(() => setFieldSaveState((state) => ({ ...state, [key]: "idle" })), 2500);
+    } catch {
+      setFieldSaveState((state) => ({ ...state, [key]: "error" }));
+      setSyncState("offline");
+      window.setTimeout(() => setFieldSaveState((state) => ({ ...state, [key]: "idle" })), 3000);
     }
   }
 
@@ -755,6 +809,12 @@ export default function App() {
                       placeholder="Why are we here? What evidence supports this position?"
                       className="w-full resize-none rounded-xl border border-border bg-background/60 p-3 text-sm leading-6 outline-none focus:border-primary transition-colors" />
                   </div>
+                  {(() => { const state = fieldSaveState[`matrix-${effectiveTeamId}`] ?? "idle"; return (
+                    <button onClick={() => saveMatrixPosition(effectiveTeamId)} disabled={state === "saving"}
+                      className="flex w-full items-center justify-center gap-2 rounded-xl border border-primary/40 bg-primary/15 px-4 py-2.5 text-xs font-bold text-primary transition-all disabled:opacity-50">
+                      {state === "saving" ? "Saving matrix position…" : state === "saved" ? <><Check size={12} />Matrix saved</> : state === "error" ? "⚠ Retry saving matrix" : <><UploadCloud size={12} />Save Matrix Position</>}
+                    </button>
+                  ); })()}
                 </div>
               </div>
             </div>
@@ -793,6 +853,8 @@ export default function App() {
             <div className="space-y-4">
               {lanes.map((lane) => {
                 const row = getActionRow(activeTeam.id, lane);
+                const actionSaveKey = `action-${activeTeam.id}-${lane}`;
+                const actionSaveState = fieldSaveState[actionSaveKey] ?? "idle";
                 return (
                   <div key={lane} className="rounded-[1.5rem] border border-border bg-card/60 overflow-hidden">
                     {/* Lane header */}
@@ -900,6 +962,18 @@ export default function App() {
                             </button>
                           ))}
                         </div>
+                      </div>
+
+                      <div className="md:col-span-2 xl:col-span-3">
+                        <button onClick={() => saveActionRow(activeTeam.id, lane)} disabled={actionSaveState === "saving"}
+                          className="flex w-full items-center justify-center gap-2 rounded-xl border px-4 py-3 text-xs font-bold transition-all disabled:opacity-50"
+                          style={{
+                            borderColor: actionSaveState === "saved" ? "#34d39966" : actionSaveState === "error" ? "#fb718566" : laneMeta[lane].color + "55",
+                            background: actionSaveState === "saved" ? "rgba(52,211,153,.12)" : actionSaveState === "error" ? "rgba(251,113,133,.10)" : laneMeta[lane].bg,
+                            color: actionSaveState === "saved" ? "#34d399" : actionSaveState === "error" ? "#fb7185" : laneMeta[lane].color,
+                          }}>
+                          {actionSaveState === "saving" ? "Saving action plan…" : actionSaveState === "saved" ? <><Check size={12} />Action plan saved to Supabase</> : actionSaveState === "error" ? "⚠ Retry saving action plan" : <><UploadCloud size={12} />Save {laneMeta[lane].label} Action Plan</>}
+                        </button>
                       </div>
 
                     </div>

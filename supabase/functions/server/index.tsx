@@ -88,17 +88,52 @@ app.get("/make-server-66fe3ecd/state", async (c) => {
 app.post("/make-server-66fe3ecd/state", async (c) => {
   const body = await c.req.json();
   const previous = await kv.get(STATE_KEY) ?? defaultState;
-  const next = { ...defaultState, ...body.state, updatedAt: stamp() };
+  const change = body?.change ?? {};
+  let next = { ...defaultState, ...previous, updatedAt: stamp() };
+
+  // Merge narrow field saves so one user's manual save never overwrites another
+  // user's newer unsaved/remote fields with a stale full-state snapshot.
+  if (change.tableName === "reflections" && change.islandId && change.teamId && change.lane) {
+    next = {
+      ...next,
+      answers: {
+        ...(next.answers ?? {}),
+        [change.islandId]: {
+          ...((next.answers ?? {})[change.islandId] ?? {}),
+          [change.teamId]: {
+            ...(((next.answers ?? {})[change.islandId] ?? {})[change.teamId] ?? {}),
+            [change.lane]: change.value ?? "",
+          },
+        },
+      },
+    };
+  } else if (change.tableName === "action_plans" && change.teamId && change.lane && change.row) {
+    next = {
+      ...next,
+      actionPlan: {
+        ...(next.actionPlan ?? {}),
+        [change.teamId]: {
+          ...((next.actionPlan ?? {})[change.teamId] ?? {}),
+          [change.lane]: change.row,
+        },
+      },
+    };
+  } else if (change.tableName === "progress_mapping_history" && change.teamId && change.position) {
+    next = { ...next, matrix: { ...(next.matrix ?? {}), [change.teamId]: change.position } };
+  } else {
+    next = { ...defaultState, ...body.state, updatedAt: stamp() };
+  }
+
   await kv.set(STATE_KEY, next);
 
   const changedBy = readActor(body);
-  const teamId = body?.auth?.teamId ?? body?.activeTeamId ?? null;
+  const teamId = body?.auth?.teamId ?? body?.activeTeamId ?? change.teamId ?? null;
   await appendHistory({
-    tableName: body?.change?.tableName ?? "workshop_state",
-    recordId: body?.change?.recordId,
-    action: body?.change?.action ?? "UPSERT",
-    oldValue: body?.change?.oldValue ?? previous,
-    newValue: body?.change?.newValue ?? next,
+    tableName: change.tableName ?? "workshop_state",
+    recordId: change.recordId,
+    action: change.action ?? "UPSERT",
+    oldValue: change.oldValue ?? previous,
+    newValue: change.newValue ?? change.value ?? change.row ?? change.position ?? next,
     changedBy,
     teamId,
   });
